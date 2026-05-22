@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use mhrv_rs::logging::CompactUtcTime;
 use tracing_subscriber::EnvFilter;
 
 use mhrv_rs::cert_installer::{install_ca, is_ca_trusted, reconcile_sudo_environment, remove_ca};
@@ -131,6 +132,7 @@ fn init_logging(level: &str) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_timer(CompactUtcTime)
         .try_init();
 }
 
