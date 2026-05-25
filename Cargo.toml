@@ -77,6 +77,9 @@ eframe = { version = "0.28", default-features = false, features = [
 ], optional = true }
 url = "2.5.8"
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56.0"
+
 # Unix-only deps. Must come after `[dependencies]` because starting a new
 # table here otherwise ends the main one — anything below it (incl. eframe)
 # would end up scoped to cfg(unix) and disappear on Windows builds.

@@ -16,6 +16,7 @@ use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
+use mhrv_rs::system_proxy::{check_system_proxy, disable_system_proxy, enable_system_proxy};
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +33,14 @@ fn main() -> eframe::Result<()> {
     mhrv_rs::rlimit::raise_nofile_limit_best_effort();
 
     let shared = Arc::new(Shared::default());
+
+    let system_proxy = check_system_proxy().unwrap_or_else(|_| {
+        push_log(&shared, "failed to read system proxy...");
+        false
+    });
+
+    shared.state.lock().unwrap().system_proxy = system_proxy;
+
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
     // Load the user's saved form first so we can seed the tracing filter
@@ -154,6 +163,7 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    system_proxy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +215,8 @@ enum Cmd {
         url: String,
         name: String,
     },
+    EnableSystemProxy(Config),
+    DisableSystemProxy,
 }
 
 struct App {
@@ -1156,7 +1168,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ── Status + stats card ────────────────────────────────────────
-            let (running, started_at, stats, ca_trusted, last_test_msg, per_site) = {
+            let (running, started_at, stats, ca_trusted, last_test_msg, per_site, system_proxy) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.running,
@@ -1165,6 +1177,7 @@ impl eframe::App for App {
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
+                    s.system_proxy,
                 )
             };
 
@@ -1398,6 +1411,35 @@ impl eframe::App for App {
                         Err(e) => {
                             self.toast = Some((format!("Cannot test: {}", e), Instant::now()));
                         }
+                    }
+                }
+
+                if !system_proxy {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Enable System Proxy").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(OK_GREEN)
+                    .min_size(egui::vec2(80.0, 32.0))
+                    .rounding(4.0);
+                    if ui.add(btn).clicked() {
+                        match self.form.to_config() {
+                            Ok(cfg) => {
+                                let _ = self.cmd_tx.send(Cmd::EnableSystemProxy(cfg));
+                            }
+                            Err(e) => {
+                                self.toast = Some((format!("Cannot start: {}", e), Instant::now()));
+                            }
+                        }
+                    }
+                } else {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Disable System Proxy").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(ERR_RED)
+                    .min_size(egui::vec2(80.0, 32.0))
+                    .rounding(4.0);
+                    if ui.add(btn).clicked() {
+                        let _ = self.cmd_tx.send(Cmd::DisableSystemProxy);
                     }
                 }
             });
@@ -1899,8 +1941,7 @@ impl App {
                     let custom_label = ui.add_sized(
                         [0.0, 0.0],
                         egui::Label::new(
-                            egui::RichText::new("Custom SNI")
-                                .color(egui::Color32::TRANSPARENT),
+                            egui::RichText::new("Custom SNI").color(egui::Color32::TRANSPARENT),
                         ),
                     );
                     ui.add(
@@ -2113,14 +2154,14 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                          https://whatismyipaddress.com in your browser \
                          via 127.0.0.1:8085. The IP shown should be your \
                          tunnel-node's VPS IP. Tracking a real Full-mode \
-                         test in #160."
+                         test in #160.",
                     ),
                     Some(mhrv_rs::config::Mode::Direct) => Some(
                         "Test Relay is wired only for apps_script mode. \
                          In direct mode there is no Apps Script relay — \
                          every request goes through the SNI-rewrite tunnel \
                          straight to Google's edge. Verify by loading \
-                         https://www.google.com via the proxy."
+                         https://www.google.com via the proxy.",
                     ),
                     _ => None,
                 };
@@ -2375,6 +2416,49 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     }
                 });
             }
+
+            Ok(Cmd::EnableSystemProxy(cfg)) => {
+                push_log(&shared, "[ui] setting system proxy...");
+
+                shared.state.lock().unwrap().system_proxy = true;
+
+                let res = enable_system_proxy(&cfg);
+                match res {
+                    Ok(()) => {
+                        push_log(
+                            &shared,
+                            &format!(
+                                "[ui] system proxy set to {}:{}",
+                                cfg.listen_host, cfg.listen_port
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        push_log(
+                            &shared,
+                            &format!("[ui] failed to enable system proxy: {}", e),
+                        );
+                    }
+                }
+            }
+
+            Ok(Cmd::DisableSystemProxy) => {
+                shared.state.lock().unwrap().system_proxy = false;
+
+                let res = disable_system_proxy();
+                match res {
+                    Ok(()) => {
+                        push_log(&shared, "[ui] system proxy disabled");
+                    }
+                    Err(e) => {
+                        push_log(
+                            &shared,
+                            &format!("[ui] failed to disable system proxy: {}", e),
+                        );
+                    }
+                }
+            }
+
             Err(_) => {}
         }
 
@@ -2492,10 +2576,7 @@ fn install_ui_tracing(shared: Arc<Shared>, config_level: &str) {
 /// by `install_ui_tracing`. `apply_log_level` uses it to swap in a new
 /// filter when the user clicks Save with a different log level (#401).
 static LOG_RELOAD: std::sync::OnceLock<
-    tracing_subscriber::reload::Handle<
-        tracing_subscriber::EnvFilter,
-        tracing_subscriber::Registry,
-    >,
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
 > = std::sync::OnceLock::new();
 
 /// Reinstall the tracing filter at runtime. Called from the Save handler
