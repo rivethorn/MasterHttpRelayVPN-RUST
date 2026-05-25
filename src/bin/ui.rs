@@ -1749,6 +1749,10 @@ impl eframe::App for App {
                 }); // end ScrollArea
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        disable_system_proxy().ok();
+    }
 }
 
 impl App {
