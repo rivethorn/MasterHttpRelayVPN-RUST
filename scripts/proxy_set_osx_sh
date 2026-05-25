@@ -63,7 +63,7 @@ is_proxy_enabled() {
     # Loop through each network service
     echo "$SERVICES" | while read -r SERVICE; do
         # Check if HTTP proxy is enabled
-        HTTP_PROXY_STATE=$(networksetup -getwebproxy "$SERVICE" | grep "Enabled:" | awk '{print $2}')
+        HTTP_PROXY_STATE=$(networksetup -getwebproxy "$SERVICE" | grep "Enabled:" | awk '{print $2}' | grep -v 'Proxy')
         if [ "$HTTP_PROXY_STATE" == "Yes" ]; then
             echo "Proxy is currently enabled for network service '$SERVICE'"
             return 0

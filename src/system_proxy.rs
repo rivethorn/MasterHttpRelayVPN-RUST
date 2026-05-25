@@ -21,9 +21,11 @@ pub fn check_system_proxy() -> std::io::Result<bool> {
     }
     #[cfg(target_os = "macos")]
     {
-        run_script(MACOS_SCRIPT, &["check"])
-            .map(|_| true)
-            .or_else(|_| Ok(false))
+        let res = run_script(MACOS_SCRIPT, &["check"]);
+        match res {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -99,6 +101,7 @@ fn run_script(script_content: &str, args: &[&str]) -> std::io::Result<()> {
 
     if !output.status.success() {
         eprintln!("Script error: {}", String::from_utf8_lossy(&output.stderr));
+        let _ = fs::remove_file(script_path);
         return Err(Error::new(ErrorKind::Other, "Failed to run proxy script"));
     }
 
