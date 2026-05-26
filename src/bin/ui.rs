@@ -16,7 +16,7 @@ use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
-use mhrv_rs::system_proxy::{check_system_proxy, disable_system_proxy, enable_system_proxy};
+use mhrv_rs::system_proxy::{disable_system_proxy, enable_system_proxy};
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -33,14 +33,6 @@ fn main() -> eframe::Result<()> {
     mhrv_rs::rlimit::raise_nofile_limit_best_effort();
 
     let shared = Arc::new(Shared::default());
-
-    let system_proxy = check_system_proxy().unwrap_or_else(|_| {
-        push_log(&shared, "failed to read system proxy...");
-        false
-    });
-
-    shared.state.lock().unwrap().system_proxy = system_proxy;
-
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
     // Load the user's saved form first so we can seed the tracing filter

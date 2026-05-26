@@ -7,28 +7,6 @@ use crate::config::Config;
 const LINUX_SCRIPT: &str = include_str!("../scripts/proxy_set_linux_sh");
 const MACOS_SCRIPT: &str = include_str!("../scripts/proxy_set_osx_sh");
 
-pub fn check_system_proxy() -> std::io::Result<bool> {
-    #[cfg(target_os = "windows")]
-    {
-        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-        let internet_settings = hkcu.open_subkey_with_flags(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-            winreg::enums::KEY_QUERY_VALUE,
-        )?;
-        let enabled: u32 = internet_settings.get_value("ProxyEnable")?;
-
-        Ok(enabled != 0)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let res = run_script(MACOS_SCRIPT, &["check"]);
-        match res {
-            Ok(()) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-}
-
 pub fn enable_system_proxy(cfg: &Config) -> Result<(), Error> {
     #[cfg(target_os = "windows")]
     {
