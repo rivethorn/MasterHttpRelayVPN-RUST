@@ -142,46 +142,6 @@ detect_desktop_environment() {
     echo "unsupported"
 }
 
-# Function to check if proxy is currently enabled for GNOME
-is_proxy_enabled() {
-    local MODE=$(gsettings get org.gnome.system.proxy mode | tr -d "'")
-    if [ "$MODE" == "none" ]; then
-        echo "Proxy is currently disabled."
-    else
-        echo "Proxy is currently enabled."
-        echo "Proxy Mode: $MODE"
-        if [ "$MODE" == "manual" ]; then
-            local HTTP_PROXY=$(gsettings get org.gnome.system.proxy.http host | tr -d "'")
-            local HTTP_PORT=$(gsettings get org.gnome.system.proxy.http port)
-            local IGNORE_HOSTS=$(gsettings get org.gnome.system.proxy ignore-hosts)
-            echo "HTTP Proxy: $HTTP_PROXY:$HTTP_PORT"
-            echo "Ignored Hosts: $IGNORE_HOSTS"
-        fi
-    fi
-}
-
-# Fuction to check if proxy is currently enabled for KDE
-is_kde_proxy_enabled() {
-
-    # Determine the correct kwriteconfig command based on KDE_SESSION_VERSION
-    if [ "$KDE_SESSION_VERSION" == "6" ]; then
-        KWRITECONFIG="kwriteconfig6"
-    else
-        KWRITECONFIG="kwriteconfig5"
-    fi
-
-    local PROXY_TYPE=$($KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key ProxyType)
-    if [ "$PROXY_TYPE" -eq 0 ]; then
-        echo "Proxy is currently disabled."
-    else
-        echo "Proxy is currently enabled."
-        local HTTP_PROXY=$($KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key httpProxy)
-        local IGNORE_HOSTS=$($KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key NoProxyFor)
-        echo "HTTP Proxy: $HTTP_PROXY"
-        echo "Ignored Hosts: $IGNORE_HOSTS"
-    fi
-}
-
 # Main script logic
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <mode> [proxy_ip proxy_port ignore_hosts]"

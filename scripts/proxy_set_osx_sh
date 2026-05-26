@@ -56,23 +56,6 @@ clear_proxy() {
     echo "Proxy for all network services has been disabled!"
 }
 
-# Function to check if proxy is currently enabled
-is_proxy_enabled() {
-    # Get all network service names
-    SERVICES=$(networksetup -listallnetworkservices | grep -v '*')
-    # Loop through each network service
-    echo "$SERVICES" | while read -r SERVICE; do
-        # Check if HTTP proxy is enabled
-        HTTP_PROXY_STATE=$(networksetup -getwebproxy "$SERVICE" | grep "Enabled:" | awk '{print $2}' | grep -v 'Proxy')
-        if [ "$HTTP_PROXY_STATE" == "Yes" ]; then
-            echo "Proxy is currently enabled for network service '$SERVICE'"
-            return 0
-        fi
-    done
-    echo "Proxy is currently disabled for all network services"
-    return 1
-}
-
 # Main script logic
 if [ "$1" == "set" ]; then
     # Check if enough parameters are passed for setting proxy
@@ -83,12 +66,9 @@ if [ "$1" == "set" ]; then
     set_proxy "$2" "$3" "${@:4}"
 elif [ "$1" == "clear" ]; then
     clear_proxy
-elif [ "$1" == "check" ]; then
-    is_proxy_enabled
 else
     echo "Usage:"
     echo "  To set proxy:    $0 set <IP Address> <Port> [Bypass Domain 1 Bypass Domain 2 ...]"
     echo "  To clear proxy: $0 clear"
-    echo "  To check proxy status: $0 check"
     exit 1
 fi
