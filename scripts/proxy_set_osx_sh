@@ -4,6 +4,7 @@
 set_proxy() {
     PROXY_IP=$1
     PROXY_PORT=$2
+    SOCKS_PORT=$3
 
     shift 2
     BYPASS_DOMAINS=("$@")
@@ -25,7 +26,7 @@ set_proxy() {
         networksetup -setsecurewebproxy "$SERVICE" "$PROXY_IP" "$PROXY_PORT"
 
         # Set SOCKS proxy
-        networksetup -setsocksfirewallproxy "$SERVICE" "$PROXY_IP" "$PROXY_PORT"
+        networksetup -setsocksfirewallproxy "$SERVICE" "$PROXY_IP" "$SOCKS_PORT"
 
         # Set bypass domains
         networksetup -setproxybypassdomains "$SERVICE" "${BYPASS_DOMAINS[@]}"

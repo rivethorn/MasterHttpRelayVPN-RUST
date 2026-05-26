@@ -24,19 +24,21 @@ set_gnome_proxy() {
     local MODE=$1
     local PROXY_IP=$2
     local PROXY_PORT=$3
-    local IGNORE_HOSTS=$4
+    local SOCKS_PORT=$4
+    local IGNORE_HOSTS=$5
 
     # Set the proxy mode
     gsettings set org.gnome.system.proxy mode "$MODE"
 
     if [ "$MODE" == "manual" ]; then
         # List of protocols
-        local PROTOCOLS=("http" "https" "ftp" "socks")
+        local PROTOCOLS=("http" "https" "ftp")
 
         # Loop through protocols to set the proxy
         for PROTOCOL in "${PROTOCOLS[@]}"; do
             gsettings set org.gnome.system.proxy.$PROTOCOL host "$PROXY_IP"
             gsettings set org.gnome.system.proxy.$PROTOCOL port "$PROXY_PORT"
+            gsettings set org.gnome.system.proxy.socks port "$SOCKS_PORT"
         done
 
         # Set ignored hosts
@@ -56,7 +58,8 @@ set_kde_proxy() {
     local MODE=$1
     local PROXY_IP=$2
     local PROXY_PORT=$3
-    local IGNORE_HOSTS=$4
+    local SOCKS_PORT=$4
+    local IGNORE_HOSTS=$5
 
     # Determine the correct kwriteconfig command based on KDE_SESSION_VERSION
     if [ "$KDE_SESSION_VERSION" == "6" ]; then
@@ -72,7 +75,7 @@ set_kde_proxy() {
         $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key httpProxy "http://$PROXY_IP:$PROXY_PORT"
         $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key httpsProxy "http://$PROXY_IP:$PROXY_PORT"
         $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key ftpProxy "http://$PROXY_IP:$PROXY_PORT"
-        $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key socksProxy "http://$PROXY_IP:$PROXY_PORT"
+        $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key socksProxy "http://$PROXY_IP:$SOCKS_PORT"
 
         # Set ignored hosts
         $KWRITECONFIG --file kioslaverc --group "Proxy Settings" --key NoProxyFor "$IGNORE_HOSTS"

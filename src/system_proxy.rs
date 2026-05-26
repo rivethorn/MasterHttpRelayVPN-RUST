@@ -30,9 +30,15 @@ pub fn enable_system_proxy(cfg: &Config) -> Result<(), Error> {
 
     #[cfg(target_os = "macos")]
     {
+        let socks = cfg.socks5_port.unwrap_or(cfg.listen_port);
         run_script(
             MACOS_SCRIPT,
-            &["set", &cfg.listen_host, &cfg.listen_port.to_string()],
+            &[
+                "set",
+                &cfg.listen_host,
+                &cfg.listen_port.to_string(),
+                &socks.to_string(),
+            ],
         )
         .map_err(|e| {
             Error::new(
@@ -44,9 +50,15 @@ pub fn enable_system_proxy(cfg: &Config) -> Result<(), Error> {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let socks = cfg.socks5_port.unwrap_or(cfg.listen_port);
         run_script(
             LINUX_SCRIPT,
-            &["manual", &cfg.listen_host, &cfg.lister_port.to_string()],
+            &[
+                "manual",
+                &cfg.listen_host,
+                &cfg.listen_port.to_string(),
+                &socks.to_string(),
+            ],
         )
         .map_err(|e| {
             Error::new(
