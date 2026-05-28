@@ -42,6 +42,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use crate::cache::{cache_key, is_cacheable_method, parse_ttl, ResponseCache};
 use crate::config::Config;
+use crate::quota_tracker::{QuotaSummary, QuotaTracker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FronterError {
@@ -420,6 +421,10 @@ pub struct DomainFronter {
     auto_blacklist_strikes: u32,
     auto_blacklist_window: Duration,
     auto_blacklist_cooldown: Duration,
+    /// Per-account quota tracker. One bucket per configured script_id,
+    /// each treated as a separate Google account per the model assumption.
+    /// Persists to quota_state.json so quota state survives restarts.
+    quota_tracker: Arc<QuotaTracker>,
     /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
@@ -599,6 +604,13 @@ impl DomainFronter {
         tls_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
         let tls_connector_h1 = TlsConnector::from(Arc::new(tls_h1));
 
+        // Build quota tracker before script_ids is moved into the struct.
+        let quota_tracker_arc = Arc::new(QuotaTracker::load(
+            &script_ids,
+            config.quota_daily_limit,
+            config.quota_safety_buffer,
+        ));
+
         Ok(Self {
             connect_host: config.google_ip.clone(),
             sni_hosts: build_sni_pool_for(
@@ -644,6 +656,7 @@ impl DomainFronter {
             auto_blacklist_cooldown: Duration::from_secs(
                 config.auto_blacklist_cooldown_secs.clamp(1, 86400),
             ),
+            quota_tracker: quota_tracker_arc,
             batch_timeout: Duration::from_secs(
                 config.request_timeout_secs.clamp(5, 300),
             ),
@@ -774,7 +787,9 @@ impl DomainFronter {
             }
             guard.clone()
         };
+        let quota = self.quota_tracker.summary();
         StatsSnapshot {
+            total_relay_calls: quota.total_relay_calls,
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
@@ -791,7 +806,13 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            quota,
         }
+    }
+
+    /// Access the quota tracker for periodic saves and startup logging.
+    pub fn quota_tracker(&self) -> &Arc<QuotaTracker> {
+        &self.quota_tracker
     }
 
     pub fn num_scripts(&self) -> usize {
@@ -819,11 +840,25 @@ impl DomainFronter {
         for _ in 0..n {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) {
+            if !bl.contains_key(sid) && !self.quota_tracker.is_hard_stopped(sid) {
                 return sid.clone();
             }
         }
-        // All blacklisted: pick whichever comes off cooldown soonest.
+        // Fallback: prefer a blacklisted-but-not-quota-exhausted account
+        // over a fully quota-exhausted one (blacklist is transient, quota
+        // exhaustion is per-window).
+        let not_exhausted: Vec<_> = bl
+            .iter()
+            .filter(|(sid, _)| !self.quota_tracker.is_hard_stopped(sid))
+            .collect();
+        if let Some((sid, _)) = not_exhausted.iter().min_by_key(|(_, t)| **t) {
+            let sid = sid.to_string();
+            bl.remove(&sid);
+            return sid;
+        }
+        // All accounts are either quota-exhausted or blacklisted. The global
+        // hard-stop check in do_relay_with_retry will handle the quota case.
+        // Fall back to soonest-off-blacklist cooldown as a last resort.
         if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
             let sid = sid.clone();
             bl.remove(&sid);
@@ -852,7 +887,10 @@ impl DomainFronter {
             }
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
+            if !bl.contains_key(sid)
+                && !self.quota_tracker.is_hard_stopped(sid)
+                && !picked.iter().any(|p| p == sid)
+            {
                 picked.push(sid.clone());
             }
         }
@@ -1771,6 +1809,23 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
+        self.quota_tracker.record_relay();
+
+        // Block ALL relay paths (exit node + Apps Script) when every account
+        // bucket is quota-exhausted. Checked here so the exit node short-circuit
+        // below can't bypass the global hard stop.
+        if self.quota_tracker.is_globally_hard_stopped() {
+            self.relay_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return error_response(
+                503,
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account.",
+            );
+        }
+
         // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
         // here, at the top of relay(), so it affects BOTH the cache key
         // (so matching requests collapse into one entry) AND the URL that
@@ -1804,6 +1859,10 @@ impl DomainFronter {
                         false,
                         bytes.len() as u64,
                         t0.elapsed().as_nanos() as u64,
+                    );
+                    self.bytes_relayed.fetch_add(
+                        (body.len() + bytes.len()) as u64,
+                        Ordering::Relaxed,
                     );
                     return bytes;
                 }
@@ -2542,6 +2601,21 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
+        // Refuse immediately if every configured account bucket is exhausted.
+        // Conservative: only triggers when all buckets are hard-stopped OR the
+        // aggregate remaining quota has crossed the collective safety threshold
+        // with confirmed quota error evidence (not random network failures).
+        if self.quota_tracker.is_globally_hard_stopped() {
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return Err(FronterError::Relay(
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account."
+                    .into(),
+            ));
+        }
+
         // Fan-out path: fire N instances in parallel, return first Ok, cancel
         // the rest. Clamps to number of available script IDs so the single-ID
         // case is a no-op even if parallel_relay>1 was configured.
@@ -2638,6 +2712,14 @@ impl DomainFronter {
         self.do_relay_once_with(script_id, method, url, headers, body).await
     }
 
+    /// Quota-recording wrapper around `do_relay_once_inner`. Counts every
+    /// Apps Script fetch attempt (including retries) against the per-account
+    /// bucket, records byte metrics on success, and marks an account as
+    /// hard-stopped when the response carries a confirmed quota error message.
+    ///
+    /// Local transport failures (Io, Tls, Timeout) are recorded as failed
+    /// attempts but do NOT trigger exhaustion — only quota-like Relay errors
+    /// qualify, keeping transient network issues from false-stopping accounts.
     async fn do_relay_once_with(
         &self,
         script_id: String,
@@ -2646,12 +2728,68 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        // Build once, wrap in Bytes (zero-copy move). h2 takes a clone
-        // (Arc bump, not memcpy); h1 fallback uses the same Bytes via
-        // Deref<&[u8]>. Saves a full payload allocation+copy per call
-        // — meaningful on range-parallel fan-out where N copies fire
-        // in parallel for one user-facing GET.
+        // Defense-in-depth: if next_script_id's last-resort fallback handed us
+        // a hard-stopped account (all exhausted, none in the blacklist), refuse
+        // here before building the payload or touching the network.
+        if self.quota_tracker.is_hard_stopped(&script_id) {
+            return Err(FronterError::Relay(format!(
+                "account {} is quota-hard-stopped; skipping dispatch",
+                mask_script_id(&script_id),
+            )));
+        }
+
         let payload: Bytes = Bytes::from(self.build_payload_json(method, url, headers, body)?);
+        let bytes_up = payload.len() as u64;
+
+        // Count ALL attempts, including retries. Each call here maps to one
+        // real UrlFetchApp.fetch() on Google's side — that's the unit Google
+        // bills against the daily quota.
+        self.quota_tracker.record_attempt(&script_id, bytes_up);
+
+        let result = self
+            .do_relay_once_inner(script_id.clone(), method, url, payload)
+            .await;
+
+        match &result {
+            Ok(bytes) => {
+                self.quota_tracker
+                    .record_success(&script_id, bytes.len() as u64);
+            }
+            Err(e) => {
+                let is_quota = is_quota_like_fronter_error(e);
+                self.quota_tracker.record_failure(&script_id, is_quota);
+                if is_quota {
+                    self.quota_tracker
+                        .mark_exhausted(&script_id, &e.to_string());
+                    tracing::warn!(
+                        "[quota] account {} exhausted: {}",
+                        mask_script_id(&script_id),
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            "[quota] {} dispatch result: {}",
+            mask_script_id(&script_id),
+            match &result {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => format!("Err({})", e),
+            },
+        );
+
+        result
+    }
+
+    async fn do_relay_once_inner(
+        &self,
+        script_id: String,
+        method: &str,
+        url: &str,
+        payload: Bytes,
+    ) -> Result<Vec<u8>, FronterError> {
+        // payload already built by the caller; path derived from script_id.
         let path = format!("/macros/s/{}/exec", script_id);
 
         // h2 fast path: one shared TCP/TLS connection multiplexes all
@@ -5053,6 +5191,9 @@ fn decode_js_string_escapes(s: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
+    /// Total relay() calls today (exit node + Apps Script). Sourced from the
+    /// persisted quota tracker so this survives proxy restarts.
+    pub total_relay_calls: u64,
     pub relay_calls: u64,
     pub relay_failures: u64,
     pub coalesced: u64,
@@ -5092,6 +5233,9 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    /// Quota state snapshot. Only meaningful in AppsScript/Full modes where
+    /// a DomainFronter is active; defaults to zero values in Direct mode.
+    pub quota: QuotaSummary,
 }
 
 impl StatsSnapshot {
@@ -5124,8 +5268,22 @@ impl StatsSnapshot {
                 )
             }
         };
+        let q = &self.quota;
+        let quota_seg = if q.account_count > 0 && (q.exhausted_count > 0 || q.global_hard_stop) {
+            format!(
+                " quota={}/{} remaining={} exhausted={}/{}{}",
+                q.requests_used_total,
+                q.daily_capacity_total,
+                q.requests_remaining_total,
+                q.exhausted_count,
+                q.account_count,
+                if q.global_hard_stop { " HARD-STOP" } else { "" },
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
@@ -5137,6 +5295,7 @@ impl StatsSnapshot {
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
             h2_seg,
+            quota_seg,
         )
     }
 
@@ -5148,8 +5307,9 @@ impl StatsSnapshot {
         fn esc(s: &str) -> String {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
+        let q = &self.quota;
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"quota_account_count":{},"quota_capacity":{},"quota_used":{},"quota_remaining":{},"quota_exhausted":{},"quota_hard_stop":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -5166,6 +5326,12 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            q.account_count,
+            q.daily_capacity_total,
+            q.requests_used_total,
+            q.requests_remaining_total,
+            q.exhausted_count,
+            q.global_hard_stop,
         )
     }
 }
@@ -5175,6 +5341,18 @@ fn should_blacklist(status: u16, body: &str) -> bool {
         return true;
     }
     looks_like_quota_error(body)
+}
+
+/// True only when the error is a Relay-level message that looks like a quota
+/// signal from Apps Script. Io/Tls/Timeout errors are local transport issues
+/// and must NOT trigger account exhaustion — that would false-stop accounts on
+/// any network glitch.
+fn is_quota_like_fronter_error(e: &FronterError) -> bool {
+    match e {
+        FronterError::Relay(msg) => looks_like_quota_error(msg),
+        FronterError::NonRetryable(inner) => is_quota_like_fronter_error(inner),
+        _ => false,
+    }
 }
 
 fn looks_like_quota_error(msg: &str) -> bool {
