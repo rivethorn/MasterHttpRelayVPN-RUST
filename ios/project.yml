@@ -14,7 +14,7 @@ settings:
     DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
     # Keep in sync with the crate version in Cargo.toml. The toolbar reads
     # CFBundleShortVersionString, which Info.plist maps to $(MARKETING_VERSION).
-    MARKETING_VERSION: "1.9.34"
+    MARKETING_VERSION: "1.9.36"
     CURRENT_PROJECT_VERSION: "1"
 
 packages: {}
