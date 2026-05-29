@@ -42,6 +42,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use crate::cache::{cache_key, is_cacheable_method, parse_ttl, ResponseCache};
 use crate::config::Config;
+use crate::quota_tracker::{QuotaSummary, QuotaTracker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FronterError {
@@ -420,10 +421,19 @@ pub struct DomainFronter {
     auto_blacklist_strikes: u32,
     auto_blacklist_window: Duration,
     auto_blacklist_cooldown: Duration,
+    /// Per-account quota tracker. One bucket per configured script_id,
+    /// each treated as a separate Google account per the model assumption.
+    /// Persists to quota_state.json so quota state survives restarts.
+    quota_tracker: Arc<QuotaTracker>,
     /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
+    /// Applies to connection establishment and response header arrival only.
     batch_timeout: Duration,
+    /// Per-chunk body streaming idle timeout. Mirrors `Config::stream_timeout_secs`.
+    /// Applied per-iteration of the body drain loop so large responses
+    /// through Apps Script are not killed mid-transfer by `batch_timeout`.
+    stream_timeout: Duration,
     /// Optional second-hop exit node (Deno Deploy / fly.io / etc.)
     /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
     /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
@@ -594,6 +604,13 @@ impl DomainFronter {
         tls_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
         let tls_connector_h1 = TlsConnector::from(Arc::new(tls_h1));
 
+        // Build quota tracker before script_ids is moved into the struct.
+        let quota_tracker_arc = Arc::new(QuotaTracker::load(
+            &script_ids,
+            config.quota_daily_limit,
+            config.quota_safety_buffer,
+        ));
+
         Ok(Self {
             connect_host: config.google_ip.clone(),
             sni_hosts: build_sni_pool_for(
@@ -639,8 +656,12 @@ impl DomainFronter {
             auto_blacklist_cooldown: Duration::from_secs(
                 config.auto_blacklist_cooldown_secs.clamp(1, 86400),
             ),
+            quota_tracker: quota_tracker_arc,
             batch_timeout: Duration::from_secs(
                 config.request_timeout_secs.clamp(5, 300),
+            ),
+            stream_timeout: Duration::from_secs(
+                config.stream_timeout_secs.clamp(10, 3600),
             ),
             exit_node_enabled: config.exit_node.enabled
                 && !config.exit_node.relay_url.is_empty()
@@ -695,6 +716,11 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Per-chunk body streaming idle timeout. Clamped to `[10s, 3600s]`.
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -761,7 +787,9 @@ impl DomainFronter {
             }
             guard.clone()
         };
+        let quota = self.quota_tracker.summary();
         StatsSnapshot {
+            total_relay_calls: quota.total_relay_calls,
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
@@ -778,7 +806,13 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            quota,
         }
+    }
+
+    /// Access the quota tracker for periodic saves and startup logging.
+    pub fn quota_tracker(&self) -> &Arc<QuotaTracker> {
+        &self.quota_tracker
     }
 
     pub fn num_scripts(&self) -> usize {
@@ -806,11 +840,25 @@ impl DomainFronter {
         for _ in 0..n {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) {
+            if !bl.contains_key(sid) && !self.quota_tracker.is_hard_stopped(sid) {
                 return sid.clone();
             }
         }
-        // All blacklisted: pick whichever comes off cooldown soonest.
+        // Fallback: prefer a blacklisted-but-not-quota-exhausted account
+        // over a fully quota-exhausted one (blacklist is transient, quota
+        // exhaustion is per-window).
+        let not_exhausted: Vec<_> = bl
+            .iter()
+            .filter(|(sid, _)| !self.quota_tracker.is_hard_stopped(sid))
+            .collect();
+        if let Some((sid, _)) = not_exhausted.iter().min_by_key(|(_, t)| **t) {
+            let sid = sid.to_string();
+            bl.remove(&sid);
+            return sid;
+        }
+        // All accounts are either quota-exhausted or blacklisted. The global
+        // hard-stop check in do_relay_with_retry will handle the quota case.
+        // Fall back to soonest-off-blacklist cooldown as a last resort.
         if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
             let sid = sid.clone();
             bl.remove(&sid);
@@ -839,7 +887,10 @@ impl DomainFronter {
             }
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
+            if !bl.contains_key(sid)
+                && !self.quota_tracker.is_hard_stopped(sid)
+                && !picked.iter().any(|p| p == sid)
+            {
                 picked.push(sid.clone());
             }
         }
@@ -1533,18 +1584,17 @@ impl DomainFronter {
             })?;
         }
 
-        // Phase 2: response headers + body drain. Bounded by the
-        // caller's deadline. Errors and timeout here are
-        // `RequestSent::Maybe` — the request is on the wire and may
-        // already have side effects.
-        let response_phase = async {
+        // Phase 2a: wait for response headers. Bounded by the caller's
+        // deadline (`batch_timeout` / `request_timeout_secs`). A timeout
+        // here means the relay never responded — safe to retry.
+        let header_phase = async {
             let response = response_fut.await.map_err(|e| {
                 (
                     FronterError::Relay(format!("h2 response: {}", e)),
                     RequestSent::Maybe,
                 )
             })?;
-            let (parts, mut body) = response.into_parts();
+            let (parts, body) = response.into_parts();
             let status = parts.status.as_u16();
 
             // Convert headers to the (String, String) Vec the rest of
@@ -1557,27 +1607,12 @@ impl DomainFronter {
                     headers.push((name.as_str().to_string(), v.to_string()));
                 }
             }
-
-            // Drain body. Release flow-control credit per chunk so
-            // large responses don't stall after the initial 4 MB window.
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(|e| {
-                    (
-                        FronterError::Relay(format!("h2 body chunk: {}", e)),
-                        RequestSent::Maybe,
-                    )
-                })?;
-                let n = chunk.len();
-                buf.extend_from_slice(&chunk);
-                let _ = body.flow_control().release_capacity(n);
-            }
-            Ok::<_, (FronterError, RequestSent)>((status, headers, buf))
+            Ok::<_, (FronterError, RequestSent)>((status, headers, body))
         };
 
-        let (status, headers, mut buf) = match tokio::time::timeout(
+        let (status, headers, mut body) = match tokio::time::timeout(
             response_deadline,
-            response_phase,
+            header_phase,
         )
         .await
         {
@@ -1585,6 +1620,32 @@ impl DomainFronter {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
         };
+
+        // Phase 2b: drain body. Each chunk is individually bounded by
+        // `stream_timeout` (default 300s) so large responses routed
+        // through Apps Script (where a 256 KB range chunk can take 30-90s
+        // of wall-clock time) are not killed by the tighter `batch_timeout`.
+        // Release flow-control credit per chunk so large responses don't
+        // stall after the initial 4 MB window.
+        let stream_timeout = self.stream_timeout();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match tokio::time::timeout(stream_timeout, body.data()).await {
+                Ok(None) => break,
+                Ok(Some(Ok(chunk))) => {
+                    let n = chunk.len();
+                    buf.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(n);
+                }
+                Ok(Some(Err(e))) => {
+                    return Err((
+                        FronterError::Relay(format!("h2 body chunk: {}", e)),
+                        RequestSent::Maybe,
+                    ));
+                }
+                Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+            }
+        }
 
         // Mirror `read_http_response`: if the server gzipped the body
         // (we asked for it via accept-encoding), decompress before
@@ -1748,6 +1809,23 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
+        self.quota_tracker.record_relay();
+
+        // Block ALL relay paths (exit node + Apps Script) when every account
+        // bucket is quota-exhausted. Checked here so the exit node short-circuit
+        // below can't bypass the global hard stop.
+        if self.quota_tracker.is_globally_hard_stopped() {
+            self.relay_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return error_response(
+                503,
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account.",
+            );
+        }
+
         // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
         // here, at the top of relay(), so it affects BOTH the cache key
         // (so matching requests collapse into one entry) AND the URL that
@@ -1782,23 +1860,41 @@ impl DomainFronter {
                         bytes.len() as u64,
                         t0.elapsed().as_nanos() as u64,
                     );
+                    self.bytes_relayed.fetch_add(
+                        (body.len() + bytes.len()) as u64,
+                        Ordering::Relaxed,
+                    );
                     return bytes;
                 }
                 Err(e) if !e.is_retryable() => {
-                    // The exit node may have already processed this
-                    // request (h2 post-send failure on a POST etc.).
-                    // Don't fall through to the direct path — that
-                    // would re-send to the same destination via Apps
-                    // Script and duplicate the side effect.
-                    tracing::warn!(
-                        "exit node failed for {} and request was already sent ({}); not falling back to direct Apps Script",
-                        url,
-                        e,
-                    );
-                    self.relay_failures.fetch_add(1, Ordering::Relaxed);
-                    let inner = e.into_inner();
-                    self.record_site(url, false, 0, t0.elapsed().as_nanos() as u64);
-                    return error_response(502, &format!("Relay error: {}", inner));
+                    // The NonRetryable guard exists to prevent duplicate
+                    // side-effects on POST/PUT/PATCH/DELETE: if the h2
+                    // outer call reached Apps Script and timed out, the
+                    // inner request may have already been executed by the
+                    // exit node. Falling through would re-send it.
+                    //
+                    // For idempotent methods (GET/HEAD/OPTIONS) there are
+                    // no side-effects, so re-sending via direct Apps Script
+                    // is always safe. Range downloads are GET — if a script
+                    // ID hits its 6-minute cap and times out, falling back
+                    // to direct Apps Script (round-robining to a fresh ID)
+                    // is the correct behaviour rather than returning 502.
+                    if is_method_safe_for_fanout(method) {
+                        tracing::warn!(
+                            "exit node non-retryable timeout for {} {} — method is idempotent, falling back to direct Apps Script",
+                            method, url,
+                        );
+                        // fall through to the regular relay path below
+                    } else {
+                        tracing::warn!(
+                            "exit node failed for {} {} and request was already sent ({}); not falling back to direct Apps Script",
+                            method, url, e,
+                        );
+                        self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                        let inner = e.into_inner();
+                        self.record_site(url, false, 0, t0.elapsed().as_nanos() as u64);
+                        return error_response(502, &format!("Relay error: {}", inner));
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1983,10 +2079,53 @@ impl DomainFronter {
             let raw = self.relay(method, url, headers, body).await;
             return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
-        // If the client already sent a Range header, honour it as-is —
-        // don't second-guess a caller that knows what bytes they want.
-        if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
+        // If the client already sent a Range header, inspect it:
+        //
+        // • bytes=N- or bytes=N-M with N>0 (resume / mid-file seek): route
+        //   through the parallel chunk path starting at offset N. Passing the
+        //   raw header to relay() would ask Apps Script to return everything
+        //   from byte N to EOF in one call — for a 3 GiB file that's well
+        //   over Apps Script's 50 MiB response cap, guaranteed 504 every try.
+        //
+        // • bytes=0-M (small specific range from the start): pass through
+        //   to relay() as-is. On relay failure close cleanly so the client
+        //   retries with its Range intact rather than restarting from byte 0.
+        if let Some(range_val) = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+            .map(|(_, v)| v.clone())
+        {
+            if let Some(start) = parse_range_start(&range_val).filter(|&s| s > 0) {
+                tracing::debug!(
+                    "range-parallel-resume: client Range {} for {}; probing from offset {}",
+                    range_val, url, start,
+                );
+                return self
+                    .stream_range_from_offset(
+                        writer,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        start,
+                        chunk,
+                        transform_head,
+                    )
+                    .await;
+            }
+            // start == 0 or unparseable — honour as-is with clean-close on failure.
             let raw = self.relay(method, url, headers, body).await;
+            let status = split_response(&raw).map(|(s, _, _)| s).unwrap_or(0);
+            if status >= 400 || status == 0 {
+                tracing::warn!(
+                    "range relay returned status {} for request {}; closing cleanly so client retries with Range",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range relay status {} — closing for clean resume",
+                    status
+                )));
+            }
             return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
 
@@ -2193,6 +2332,119 @@ impl DomainFronter {
         write_response_with_head_transform(writer, &raw, &transform_head).await
     }
 
+    /// Resume a large download from a byte offset by probing at
+    /// `[start, start+chunk-1]` and streaming the remaining chunks in
+    /// parallel — exactly like the initial download path but starting
+    /// mid-file. Called when the client sends `Range: bytes=N-` with
+    /// N > 0 (wget `-c`, browser resume). Responds with `206 Partial
+    /// Content` so the client appends to its existing partial file.
+    async fn stream_range_from_offset<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        client_headers: &[(String, String)],
+        body: &[u8],
+        start: u64,
+        chunk: u64,
+        transform_head: &F,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        const MAX_PARALLEL: usize = 16;
+
+        // Strip client's Range header; add our probe range [start, start+chunk-1].
+        let mut probe_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+        probe_headers.push((
+            "Range".into(),
+            format!("bytes={}-{}", start, start + chunk - 1),
+        ));
+
+        let first = self.relay(method, url, &probe_headers, body).await;
+        let (status, resp_headers, resp_body) = match split_response(&first) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "range-parallel-resume: malformed probe response for {}; closing cleanly",
+                    url
+                );
+                return Err(std::io::Error::other(
+                    "range-parallel-resume: malformed probe — closing for clean resume",
+                ));
+            }
+        };
+
+        if status != 206 {
+            if status >= 400 {
+                tracing::warn!(
+                    "range-parallel-resume: probe returned {} for {}; closing cleanly",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range-parallel-resume: probe status {} — closing for clean resume",
+                    status,
+                )));
+            }
+            // Non-206 success (origin sent 200 for the full body) — forward as-is.
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_range =
+            match validate_probe_range_at_offset(status, &resp_headers, resp_body, start, start + chunk - 1)
+            {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        "range-parallel-resume: invalid 206 for {}; closing cleanly",
+                        url,
+                    );
+                    return Err(std::io::Error::other(
+                        "range-parallel-resume: invalid 206 — closing for clean resume",
+                    ));
+                }
+            };
+        let total = probe_range.total;
+
+        // Probe covered the rest of the file — forward this 206 as-is.
+        if (probe_range.end + 1) >= total {
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_end = probe_range.end;
+        let body_total = total - start;
+        let expected_chunks = (total - probe_end - 1).div_ceil(chunk);
+        tracing::info!(
+            "range-parallel-resume: {} total, resuming from byte {}, {} more chunks after probe, up to {} in flight for {}",
+            total, start, expected_chunks, MAX_PARALLEL, url,
+        );
+
+        // base_headers for fetch_chunks_stream must not include Range
+        // (fetch_chunks_stream adds its own per-chunk Range header).
+        let base_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+
+        let fetches = self.fetch_chunks_stream(
+            url,
+            &base_headers,
+            plan_remaining_ranges(probe_end, total, chunk),
+            total,
+            MAX_PARALLEL,
+        );
+
+        let head = assemble_206_head(&resp_headers, start, total);
+        let head = transform_head(&head);
+        stream_chunks_to_writer(writer, &head, resp_body, body_total, fetches, url).await
+    }
+
     /// Backward-compatible wrapper around `relay_parallel_range_to`
     /// that buffers the full response into a `Vec<u8>` before
     /// returning. Retained so downstream callers (and external
@@ -2349,6 +2601,21 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
+        // Refuse immediately if every configured account bucket is exhausted.
+        // Conservative: only triggers when all buckets are hard-stopped OR the
+        // aggregate remaining quota has crossed the collective safety threshold
+        // with confirmed quota error evidence (not random network failures).
+        if self.quota_tracker.is_globally_hard_stopped() {
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return Err(FronterError::Relay(
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account."
+                    .into(),
+            ));
+        }
+
         // Fan-out path: fire N instances in parallel, return first Ok, cancel
         // the rest. Clamps to number of available script IDs so the single-ID
         // case is a no-op even if parallel_relay>1 was configured.
@@ -2445,6 +2712,14 @@ impl DomainFronter {
         self.do_relay_once_with(script_id, method, url, headers, body).await
     }
 
+    /// Quota-recording wrapper around `do_relay_once_inner`. Counts every
+    /// Apps Script fetch attempt (including retries) against the per-account
+    /// bucket, records byte metrics on success, and marks an account as
+    /// hard-stopped when the response carries a confirmed quota error message.
+    ///
+    /// Local transport failures (Io, Tls, Timeout) are recorded as failed
+    /// attempts but do NOT trigger exhaustion — only quota-like Relay errors
+    /// qualify, keeping transient network issues from false-stopping accounts.
     async fn do_relay_once_with(
         &self,
         script_id: String,
@@ -2453,12 +2728,68 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        // Build once, wrap in Bytes (zero-copy move). h2 takes a clone
-        // (Arc bump, not memcpy); h1 fallback uses the same Bytes via
-        // Deref<&[u8]>. Saves a full payload allocation+copy per call
-        // — meaningful on range-parallel fan-out where N copies fire
-        // in parallel for one user-facing GET.
+        // Defense-in-depth: if next_script_id's last-resort fallback handed us
+        // a hard-stopped account (all exhausted, none in the blacklist), refuse
+        // here before building the payload or touching the network.
+        if self.quota_tracker.is_hard_stopped(&script_id) {
+            return Err(FronterError::Relay(format!(
+                "account {} is quota-hard-stopped; skipping dispatch",
+                mask_script_id(&script_id),
+            )));
+        }
+
         let payload: Bytes = Bytes::from(self.build_payload_json(method, url, headers, body)?);
+        let bytes_up = payload.len() as u64;
+
+        // Count ALL attempts, including retries. Each call here maps to one
+        // real UrlFetchApp.fetch() on Google's side — that's the unit Google
+        // bills against the daily quota.
+        self.quota_tracker.record_attempt(&script_id, bytes_up);
+
+        let result = self
+            .do_relay_once_inner(script_id.clone(), method, url, payload)
+            .await;
+
+        match &result {
+            Ok(bytes) => {
+                self.quota_tracker
+                    .record_success(&script_id, bytes.len() as u64);
+            }
+            Err(e) => {
+                let is_quota = is_quota_like_fronter_error(e);
+                self.quota_tracker.record_failure(&script_id, is_quota);
+                if is_quota {
+                    self.quota_tracker
+                        .mark_exhausted(&script_id, &e.to_string());
+                    tracing::warn!(
+                        "[quota] account {} exhausted: {}",
+                        mask_script_id(&script_id),
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            "[quota] {} dispatch result: {}",
+            mask_script_id(&script_id),
+            match &result {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => format!("Err({})", e),
+            },
+        );
+
+        result
+    }
+
+    async fn do_relay_once_inner(
+        &self,
+        script_id: String,
+        method: &str,
+        url: &str,
+        payload: Bytes,
+    ) -> Result<Vec<u8>, FronterError> {
+        // payload already built by the caller; path derived from script_id.
         let path = format!("/macros/s/{}/exec", script_id);
 
         // h2 fast path: one shared TCP/TLS connection multiplexes all
@@ -3408,6 +3739,34 @@ fn validate_probe_range(
     None
 }
 
+/// Parse the start byte from a `Range: bytes=N-` or `Range: bytes=N-M` header value.
+fn parse_range_start(range_header: &str) -> Option<u64> {
+    let s = range_header.trim().strip_prefix("bytes=")?;
+    s.split('-').next()?.trim().parse::<u64>().ok()
+}
+
+/// Variant of `validate_probe_range` for mid-file resume probes where
+/// `Content-Range: bytes N-M/total` has a non-zero start.
+fn validate_probe_range_at_offset(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    req_start: u64,
+    req_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != req_start || range.end > req_end {
+        return None;
+    }
+    if content_range_matches_body(range, body.len()) {
+        return Some(range);
+    }
+    None
+}
+
 fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -> bool {
     // Apps Script may decode a gzip body while preserving the origin's
     // compressed Content-Range. For the synthetic first probe only, a
@@ -3494,6 +3853,46 @@ fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> 
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
+    out
+}
+
+/// Build a `HTTP/1.1 206 Partial Content` head for the resume streaming
+/// path. `start` is the first byte the client requested; `total` is the
+/// full file size reported by the origin's `Content-Range`. Mirrors
+/// `assemble_200_head`'s header-skip rules.
+fn assemble_206_head(src_headers: &[(String, String)], start: u64, total: u64) -> Vec<u8> {
+    let skip = |k: &str| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "content-range"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive",
+        )
+    };
+    let length = total.saturating_sub(start);
+    let mut out: Vec<u8> = b"HTTP/1.1 206 Partial Content\r\n".to_vec();
+    for (k, v) in src_headers {
+        if skip(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(
+        format!(
+            "Content-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+            start,
+            total - 1,
+            total,
+            length,
+        )
+        .as_bytes(),
+    );
     out
 }
 
@@ -4792,6 +5191,9 @@ fn decode_js_string_escapes(s: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
+    /// Total relay() calls today (exit node + Apps Script). Sourced from the
+    /// persisted quota tracker so this survives proxy restarts.
+    pub total_relay_calls: u64,
     pub relay_calls: u64,
     pub relay_failures: u64,
     pub coalesced: u64,
@@ -4831,6 +5233,9 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    /// Quota state snapshot. Only meaningful in AppsScript/Full modes where
+    /// a DomainFronter is active; defaults to zero values in Direct mode.
+    pub quota: QuotaSummary,
 }
 
 impl StatsSnapshot {
@@ -4863,8 +5268,22 @@ impl StatsSnapshot {
                 )
             }
         };
+        let q = &self.quota;
+        let quota_seg = if q.account_count > 0 && (q.exhausted_count > 0 || q.global_hard_stop) {
+            format!(
+                " quota={}/{} remaining={} exhausted={}/{}{}",
+                q.requests_used_total,
+                q.daily_capacity_total,
+                q.requests_remaining_total,
+                q.exhausted_count,
+                q.account_count,
+                if q.global_hard_stop { " HARD-STOP" } else { "" },
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
@@ -4876,6 +5295,7 @@ impl StatsSnapshot {
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
             h2_seg,
+            quota_seg,
         )
     }
 
@@ -4887,8 +5307,9 @@ impl StatsSnapshot {
         fn esc(s: &str) -> String {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
+        let q = &self.quota;
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"quota_account_count":{},"quota_capacity":{},"quota_used":{},"quota_remaining":{},"quota_exhausted":{},"quota_hard_stop":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -4905,6 +5326,12 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            q.account_count,
+            q.daily_capacity_total,
+            q.requests_used_total,
+            q.requests_remaining_total,
+            q.exhausted_count,
+            q.global_hard_stop,
         )
     }
 }
@@ -4914,6 +5341,18 @@ fn should_blacklist(status: u16, body: &str) -> bool {
         return true;
     }
     looks_like_quota_error(body)
+}
+
+/// True only when the error is a Relay-level message that looks like a quota
+/// signal from Apps Script. Io/Tls/Timeout errors are local transport issues
+/// and must NOT trigger account exhaustion — that would false-stop accounts on
+/// any network glitch.
+fn is_quota_like_fronter_error(e: &FronterError) -> bool {
+    match e {
+        FronterError::Relay(msg) => looks_like_quota_error(msg),
+        FronterError::NonRetryable(inner) => is_quota_like_fronter_error(inner),
+        _ => false,
+    }
 }
 
 fn looks_like_quota_error(msg: &str) -> bool {

@@ -132,6 +132,7 @@ fn install_logging_once() {
             .with_target(false)
             .with_ansi(false)
             .with_writer(LogcatWriter)
+            .with_timer(crate::logging::CompactUtcTime)
             .try_init();
 
         let _ = rustls::crypto::ring::default_provider().install_default();

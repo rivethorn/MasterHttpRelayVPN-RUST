@@ -6,8 +6,7 @@
 # `docs/changelog/v<ver>.md` is prefilled.
 #
 # Cost: one ubuntu-latest job per relevant PR/push event, single API
-# call, no compile, no tests. Zero contention with the self-hosted
-# Hetzner runners that release.yml uses.
+# call, no compile, no tests.
 
 name: release-drafter
 

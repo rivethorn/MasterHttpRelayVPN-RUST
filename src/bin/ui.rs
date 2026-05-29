@@ -155,6 +155,11 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Quota state from the most recent PollStats snapshot. None until the
+    /// first poll completes. Used by the quota display and hard-stop indicator.
+    /// TODO(quota-dashboard): feed this into a dedicated QuotaWidget once
+    /// the UI is remodeled.
+    quota: Option<mhrv_rs::quota_tracker::QuotaSummary>,
     system_proxy: bool,
 }
 
@@ -298,10 +303,14 @@ struct FormState {
     auto_blacklist_window_secs: u64,
     auto_blacklist_cooldown_secs: u64,
     request_timeout_secs: u64,
+    stream_timeout_secs: u64,
     /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
+    /// Quota config — config-only round-trip fields. No UI editor yet.
+    quota_daily_limit: u64,
+    quota_safety_buffer: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -395,7 +404,10 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
             exit_node: c.exit_node.clone(),
+            quota_daily_limit: c.quota_daily_limit,
+            quota_safety_buffer: c.quota_safety_buffer,
         }
     } else {
         FormState {
@@ -437,7 +449,10 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
+            stream_timeout_secs: 300,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            quota_daily_limit: 20_000,
+            quota_safety_buffer: 500,
         }
     };
     (form, load_err)
@@ -622,10 +637,15 @@ impl FormState {
             auto_blacklist_window_secs: self.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: self.auto_blacklist_cooldown_secs,
             request_timeout_secs: self.request_timeout_secs,
+            stream_timeout_secs: self.stream_timeout_secs,
             // Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
+            // Quota limits: config-only for now, round-tripped through FormState
+            // so Save doesn't drop hand-edited values.
+            quota_daily_limit: self.quota_daily_limit,
+            quota_safety_buffer: self.quota_safety_buffer,
         })
     }
 }
@@ -639,6 +659,176 @@ fn save_config(cfg: &Config) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())?;
     std::fs::write(&path, toml_str).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+#[derive(serde::Serialize)]
+struct ConfigWire<'a> {
+    mode: &'a str,
+    google_ip: &'a str,
+    front_domain: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script_id: Option<ScriptIdWire<'a>>,
+    auth_key: &'a str,
+    listen_host: &'a str,
+    listen_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socks5_port: Option<u16>,
+    log_level: &'a str,
+    verify_ssl: bool,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    hosts: &'a std::collections::HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_socks5: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    parallel_relay: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sni_hosts: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "is_false")]
+    normalize_x_graphql: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    youtube_via_relay: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    passthrough_hosts: &'a Vec<String>,
+    // IP-scan knobs. These used to be missing from the wire struct, so
+    // every Save-config silently dropped them — the user would toggle
+    // "fetch from API" on, save, reopen, and find it off again. Add
+    // them here and keep them in sync if Config ever grows more.
+    #[serde(skip_serializing_if = "is_false")]
+    fetch_ips_from_api: bool,
+    max_ips_to_scan: usize,
+    scan_batch_size: usize,
+    google_ip_validation: bool,
+    /// Default false (= bypass DoH). Only emitted when explicitly true
+    /// so unchanged configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
+    tunnel_doh: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bypass_doh_hosts: &'a Vec<String>,
+    /// PR #763: default true (= browser DoH rejected, system DNS used).
+    /// Skip when matching default to keep unchanged configs clean —
+    /// emit only when the user has explicitly disabled the block.
+    #[serde(skip_serializing_if = "is_true")]
+    block_doh: bool,
+    /// Default false. Emit only when the user enables STUN/TURN blocking.
+    #[serde(skip_serializing_if = "is_false")]
+    block_stun: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fronting_groups: &'a Vec<FrontingGroup>,
+    /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
+    /// serialization when matching the historical defaults so unchanged
+    /// configs stay clean — only emitted when the user has explicitly
+    /// tuned them.
+    #[serde(skip_serializing_if = "is_default_strikes")]
+    auto_blacklist_strikes: u32,
+    #[serde(skip_serializing_if = "is_default_window_secs")]
+    auto_blacklist_window_secs: u64,
+    #[serde(skip_serializing_if = "is_default_cooldown_secs")]
+    auto_blacklist_cooldown_secs: u64,
+    #[serde(skip_serializing_if = "is_default_timeout_secs")]
+    request_timeout_secs: u64,
+    #[serde(skip_serializing_if = "is_default_stream_timeout_secs")]
+    stream_timeout_secs: u64,
+    /// HTTP/2 multiplexing kill switch. Default false (h2 active); only
+    /// emitted on save when the user has explicitly disabled h2, so
+    /// unchanged configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
+    force_http1: bool,
+    /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
+    /// grok.com / x.com via exit-node second-hop relay). Skip when fully
+    /// default (disabled with no URL/PSK/hosts) so configs without
+    /// exit-node setup stay clean. Round-tripped through FormState so
+    /// Save preserves user-edited values.
+    #[serde(skip_serializing_if = "is_default_exit_node")]
+    exit_node: &'a mhrv_rs::config::ExitNodeConfig,
+}
+
+fn is_default_strikes(v: &u32) -> bool {
+    *v == 3
+}
+fn is_default_window_secs(v: &u64) -> bool {
+    *v == 30
+}
+fn is_default_cooldown_secs(v: &u64) -> bool {
+    *v == 120
+}
+fn is_default_timeout_secs(v: &u64) -> bool {
+    *v == 30
+}
+fn is_default_stream_timeout_secs(v: &u64) -> bool {
+    *v == 300
+}
+fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
+    !en.enabled
+        && en.relay_url.is_empty()
+        && en.psk.is_empty()
+        && en.hosts.is_empty()
+        && (en.mode.is_empty() || en.mode == "selective")
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ScriptIdWire<'a> {
+    One(&'a str),
+    Many(Vec<&'a str>),
+}
+
+impl<'a> From<&'a Config> for ConfigWire<'a> {
+    fn from(c: &'a Config) -> Self {
+        let script_id = c.script_id.as_ref().map(|s| match s {
+            ScriptId::One(v) => ScriptIdWire::One(v.as_str()),
+            ScriptId::Many(v) => ScriptIdWire::Many(v.iter().map(String::as_str).collect()),
+        });
+        ConfigWire {
+            mode: c.mode.as_str(),
+            google_ip: c.google_ip.as_str(),
+            front_domain: c.front_domain.as_str(),
+            script_id,
+            auth_key: c.auth_key.as_str(),
+            listen_host: c.listen_host.as_str(),
+            listen_port: c.listen_port,
+            socks5_port: c.socks5_port,
+            log_level: c.log_level.as_str(),
+            verify_ssl: c.verify_ssl,
+            hosts: &c.hosts,
+            upstream_socks5: c.upstream_socks5.as_deref(),
+            parallel_relay: c.parallel_relay,
+            sni_hosts: c
+                .sni_hosts
+                .as_ref()
+                .map(|v| v.iter().map(String::as_str).collect()),
+            normalize_x_graphql: c.normalize_x_graphql,
+            youtube_via_relay: c.youtube_via_relay,
+            passthrough_hosts: &c.passthrough_hosts,
+            fetch_ips_from_api: c.fetch_ips_from_api,
+            max_ips_to_scan: c.max_ips_to_scan,
+            scan_batch_size: c.scan_batch_size,
+            google_ip_validation: c.google_ip_validation,
+            tunnel_doh: c.tunnel_doh,
+            bypass_doh_hosts: &c.bypass_doh_hosts,
+            block_doh: c.block_doh,
+            block_stun: c.block_stun,
+            fronting_groups: &c.fronting_groups,
+            auto_blacklist_strikes: c.auto_blacklist_strikes,
+            auto_blacklist_window_secs: c.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
+            request_timeout_secs: c.request_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            force_http1: c.force_http1,
+            exit_node: &c.exit_node,
+        }
+    }
 }
 
 /// Accent color — same blue used throughout the UI for primary actions.
@@ -1160,7 +1350,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ── Status + stats card ────────────────────────────────────────
-            let (running, started_at, stats, ca_trusted, last_test_msg, per_site, system_proxy) = {
+            let (running, started_at, stats, ca_trusted, last_test_msg, per_site, quota_state, system_proxy) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.running,
@@ -1169,142 +1359,254 @@ impl eframe::App for App {
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
+                    s.quota.clone(),
                     s.system_proxy,
                 )
             };
 
-            let status_title = if running {
-                let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
-                format!("Traffic  ·  uptime {}", fmt_duration(up))
-            } else {
-                "Traffic  ·  (not running)".to_string()
-            };
-            section(ui, &status_title, |ui| {
-                if let Some(s) = &stats {
-                    // Compact two-column layout so 7 metrics fit in ~4 rows
-                    // instead of a tall vertical strip.
-                    let rows: Vec<(&str, String)> = vec![
-                        ("relay calls", s.relay_calls.to_string()),
-                        ("failures", s.relay_failures.to_string()),
-                        ("coalesced", s.coalesced.to_string()),
-                        (
-                            "cache hits",
-                            format!(
-                                "{} / {}  ({:.0}%)",
-                                s.cache_hits,
-                                s.cache_hits + s.cache_misses,
-                                s.hit_rate()
-                            ),
-                        ),
-                        ("cache size", format!("{} KB", s.cache_bytes / 1024)),
-                        ("bytes relayed", fmt_bytes(s.bytes_relayed)),
-                        (
-                            "active scripts",
-                            format!(
-                                "{} / {}",
-                                s.total_scripts - s.blacklisted_scripts,
-                                s.total_scripts
-                            ),
-                        ),
-                    ];
-                    egui::Grid::new("stats")
-                        .num_columns(4)
-                        .spacing([16.0, 4.0])
-                        .show(ui, |ui| {
-                            for chunk in rows.chunks(2) {
-                                for (label, value) in chunk.iter() {
-                                    ui.add_sized(
-                                        [110.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(*label)
-                                                .color(egui::Color32::from_gray(150)),
-                                        ),
-                                    );
-                                    ui.add_sized(
-                                        [140.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(value).monospace(),
-                                        ),
-                                    );
-                                }
-                                // Pad the final short row so grid columns stay aligned.
-                                if chunk.len() == 1 {
-                                    ui.label("");
-                                    ui.label("");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                } else {
-                    ui.label(
-                        egui::RichText::new("No traffic yet — click Start and send a request.")
-                            .color(egui::Color32::from_gray(150))
-                            .italics(),
-                    );
-                }
-            });
-
-            // ── Usage today (estimated) — daily budget tracker ───────────────
-            // Client-side estimate from our own atomic counters. Counts only
-            // successful relay calls this process saw since 00:00 UTC. Google's
-            // actual quota bucket is per-Apps-Script-project and per-Google
-            // account — if multiple devices share the same deployment, each
-            // client only sees its own share. We link to the Google dashboard
-            // for the authoritative number.
+            // ── Usage today — daily budget tracker + traffic stats ───────────
+            // TODO(quota-dashboard): Replace this inline grid with a dedicated
+            // QuotaWidget / QuotaDashboard when the UI is remodeled. The quota
+            // state is already wired through UiState.quota and StatsSnapshot.quota.
             if let Some(s) = &stats {
                 ui.add_space(2.0);
-                section(ui, "Usage today (estimated)", |ui| {
-                    // Free-tier Apps Script UrlFetchApp quota. Workspace /
-                    // paid accounts get 100k but most users are on free.
-                    const FREE_QUOTA_PER_DAY: u64 = 20_000;
-                    let pct = if FREE_QUOTA_PER_DAY > 0 {
-                        (s.today_calls as f64 / FREE_QUOTA_PER_DAY as f64) * 100.0
-                    } else { 0.0 };
-                    let reset = s.today_reset_secs;
-                    let reset_str = format!(
-                        "{}h {}m",
-                        reset / 3600,
-                        (reset / 60) % 60,
-                    );
-                    let rows: Vec<(&str, String)> = vec![
-                        (
-                            "calls today",
-                            format!(
-                                "{} / {}  ({:.1}%)",
-                                s.today_calls, FREE_QUOTA_PER_DAY, pct
-                            ),
-                        ),
-                        ("bytes today", fmt_bytes(s.today_bytes)),
-                        ("PT day", s.today_key.clone()),
-                        ("resets in", reset_str),
-                    ];
+
+                let usage_title = if running {
+                    let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
+                    format!("Usage today  ·  uptime {}", fmt_duration(up))
+                } else {
+                    "Usage today  ·  (not running)".to_string()
+                };
+
+                section(ui, &usage_title, |ui| {
+                    // Hard-stop / exhaustion banners at the top of the section.
+                    if let Some(q) = &quota_state {
+                        if q.global_hard_stop {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 80, 80),
+                                "⚠  All account quota exhausted — Apps Script relay hard-stopped",
+                            );
+                            // TODO(quota-dashboard): disable the Start button here once
+                            // the button state wiring supports conditional disabling.
+                            ui.add_space(4.0);
+                        } else if q.exhausted_count > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 170, 80),
+                                format!(
+                                    "⚠  {}/{} account(s) exhausted — routing to remaining accounts",
+                                    q.exhausted_count, q.account_count
+                                ),
+                            );
+                            ui.add_space(2.0);
+                        }
+                    }
+
+                    // Use quota-tracked daily capacity when available, fall back to
+                    // the free-tier default for display purposes.
+                    // quota_used: total relay() calls (exit node + Apps Script combined)
+                    // so "fetches today" reflects all proxied traffic, not just Apps Script.
+                    let (quota_cap, quota_used, _quota_remaining, any_exhausted, global_stop) =
+                        if let Some(q) = &quota_state {
+                            (
+                                q.daily_capacity_total.max(1),
+                                s.total_relay_calls,
+                                q.requests_remaining_total,
+                                q.exhausted_count > 0,
+                                q.global_hard_stop,
+                            )
+                        } else {
+                            (20_000u64, s.total_relay_calls, 20_000u64.saturating_sub(s.total_relay_calls), false, false)
+                        };
+
+                    let pct = (quota_used as f64 / quota_cap as f64) * 100.0;
+                    let alert = any_exhausted || global_stop;
+
+                    // fetches today — turns red when any account is exhausted
+                    let calls_str = format!("{} / {}  ({:.1}%)", quota_used, quota_cap, pct);
+                    let calls_text = if alert {
+                        egui::RichText::new(&calls_str)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(220, 80, 80))
+                    } else {
+                        egui::RichText::new(&calls_str).monospace()
+                    };
+
+                    // Next reset: use rolling window from active accounts, fall back to
+                    // soonest reset across ALL accounts (including stopped ones) when all
+                    // are exhausted, then finally PT midnight as last resort.
+                    let reset_str = if let Some(q) = &quota_state {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let reset_ts = q.next_reset_at.or(q.next_reset_at_any);
+                        if let Some(ts) = reset_ts {
+                            let secs = ts.saturating_sub(now);
+                            format!("{}h {}m (rolling)", secs / 3600, (secs / 60) % 60)
+                        } else {
+                            let reset = s.today_reset_secs;
+                            format!("{}h {}m (PT midnight)", reset / 3600, (reset / 60) % 60)
+                        }
+                    } else {
+                        let reset = s.today_reset_secs;
+                        format!("{}h {}m", reset / 3600, (reset / 60) % 60)
+                    };
+
                     egui::Grid::new("usage_today")
                         .num_columns(4)
                         .spacing([16.0, 4.0])
                         .show(ui, |ui| {
-                            for chunk in rows.chunks(2) {
-                                for (label, value) in chunk.iter() {
+                            // Row 1: fetches today | resets in
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("fetches today")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(calls_text),
+                            );
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("resets in")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&reset_str).monospace(),
+                                ),
+                            );
+                            ui.end_row();
+
+                            // Row 3: relay calls+failures | cache
+                            let relay_str = if s.relay_failures > 0 {
+                                format!("{} ({} failed)", s.relay_calls, s.relay_failures)
+                            } else {
+                                s.relay_calls.to_string()
+                            };
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("relay calls")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(egui::RichText::new(&relay_str).monospace()),
+                            );
+                            let cache_total = s.cache_hits + s.cache_misses;
+                            let cache_str = if cache_total > 0 {
+                                format!("{}/{} ({:.0}% hit)", s.cache_hits, cache_total, s.hit_rate())
+                            } else {
+                                "—".to_string()
+                            };
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("cache")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(egui::RichText::new(&cache_str).monospace()),
+                            );
+                            ui.end_row();
+
+                            // Row 4: PT day | accounts (if quota available)
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("PT day")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&s.today_key).monospace(),
+                                ),
+                            );
+                            if let Some(q) = &quota_state {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("accounts")
+                                            .color(egui::Color32::from_gray(150)),
+                                    ),
+                                );
+                                let acct_str = if q.exhausted_count > 0 {
+                                    format!(
+                                        "{}/{} ({} exhausted)",
+                                        q.account_count - q.exhausted_count,
+                                        q.account_count,
+                                        q.exhausted_count,
+                                    )
+                                } else {
+                                    format!("{}/{} active", q.account_count, q.account_count)
+                                };
+                                let acct_text = if q.exhausted_count > 0 {
+                                    egui::RichText::new(&acct_str)
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(220, 170, 80))
+                                } else {
+                                    egui::RichText::new(&acct_str).monospace()
+                                };
+                                ui.add_sized(
+                                    [140.0, 18.0],
+                                    egui::Label::new(acct_text),
+                                );
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            ui.end_row();
+
+                            // Row 5: data transferred with stable estimated daily total.
+                            // Uses bytes_relayed (all relay paths: exit node + Apps Script).
+                            // Estimate clamps avg bytes/call to 50 KB–500 KB so early sparse
+                            // samples don't make the projection swing wildly.
+                            if let Some(q) = &quota_state {
+                                if s.bytes_relayed > 0 {
+                                    let data_str = if s.total_relay_calls >= 5 {
+                                        let raw_avg = s.bytes_relayed as f64 / s.total_relay_calls as f64;
+                                        let avg = raw_avg.clamp(50_000.0, 500_000.0);
+                                        let est = (avg * q.daily_capacity_total as f64) as u64;
+                                        format!(
+                                            "{} / {} (est.)",
+                                            fmt_bytes_approx(s.bytes_relayed),
+                                            fmt_bytes_approx(est),
+                                        )
+                                    } else {
+                                        fmt_bytes_approx(s.bytes_relayed)
+                                    };
                                     ui.add_sized(
                                         [110.0, 18.0],
                                         egui::Label::new(
-                                            egui::RichText::new(*label)
+                                            egui::RichText::new("data transferred")
                                                 .color(egui::Color32::from_gray(150)),
                                         ),
                                     );
                                     ui.add_sized(
                                         [140.0, 18.0],
                                         egui::Label::new(
-                                            egui::RichText::new(value).monospace(),
+                                            egui::RichText::new(&data_str).monospace(),
                                         ),
                                     );
-                                }
-                                if chunk.len() == 1 {
                                     ui.label("");
                                     ui.label("");
+                                    ui.end_row();
                                 }
-                                ui.end_row();
                             }
-                        });
+                        }); // end egui::Grid "usage_today"
+
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.hyperlink_to(
@@ -2001,6 +2303,12 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
+/// Approximate bytes display with a `~` prefix, used for quota tracker totals
+/// where the value is an estimate (bytes_up + bytes_down from relay payloads).
+fn fmt_bytes_approx(b: u64) -> String {
+    format!("~{}", fmt_bytes(b))
+}
+
 // ---------- Background thread: owns the tokio runtime + proxy lifecycle ----------
 
 fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
@@ -2023,9 +2331,11 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         if let Some(fronter) = f.as_ref() {
                             let s = fronter.snapshot_stats();
                             let per_site = fronter.snapshot_per_site();
+                            let quota = s.quota.clone();
                             let mut st = shared.state.lock().unwrap();
                             st.last_stats = Some(s);
                             st.last_per_site = per_site;
+                            st.quota = Some(quota);
                         }
                     });
                 }
@@ -2560,7 +2870,8 @@ fn install_ui_tracing(shared: Arc<Shared>, config_level: &str) {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(writer);
+        .with_writer(writer)
+        .with_timer(mhrv_rs::logging::CompactUtcTime);
 
     let _ = tracing_subscriber::registry()
         .with(filter_layer)

@@ -376,8 +376,21 @@ pub struct Config {
     /// retry sooner when a deployment hangs. Floor `5`, ceiling `300`
     /// (anything beyond exceeds Apps Script's hard 6-min cap with
     /// no benefit).
+    ///
+    /// This applies to connection establishment and response header
+    /// arrival only. Body streaming is governed by `stream_timeout_secs`.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Per-chunk body streaming idle timeout (seconds). Default `300`.
+    /// Applies to each individual body chunk read after headers arrive —
+    /// a chunk that goes silent for longer than this is considered a
+    /// stalled connection and the request is aborted. Distinct from
+    /// `request_timeout_secs` so large responses through Apps Script
+    /// (where each 256 KB range chunk can take 30-90s) are not killed
+    /// mid-transfer. Floor `10`, ceiling `3600`.
+    #[serde(default = "default_stream_timeout_secs")]
+    pub stream_timeout_secs: u64,
 
     /// Optional second-hop exit node, for sites that block traffic
     /// from Google datacenter IPs (Apps Script's outbound IP space).
@@ -398,6 +411,21 @@ pub struct Config {
     /// Setup walkthrough at `assets/exit_node/README.md`. Default off.
     #[serde(default)]
     pub exit_node: ExitNodeConfig,
+
+    /// Daily request quota per account bucket. Each configured script_id is
+    /// treated as one separate account. Default 20_000 matches the free-tier
+    /// Apps Script UrlFetchApp limit. Set to 100_000 for Workspace accounts.
+    #[serde(default = "default_quota_daily_limit")]
+    pub quota_daily_limit: u64,
+
+    /// Per-account safety buffer. An account is considered effectively
+    /// exhausted when its remaining requests for the current 24-hour window
+    /// drop below this value. The reserve intentionally keeps calls away from
+    /// Google's hard quota edge to avoid triggering anti-abuse heuristics.
+    /// Aggregate hard-stop reserve = account_count × quota_safety_buffer.
+    /// Default 500.
+    #[serde(default = "default_quota_safety_buffer")]
+    pub quota_safety_buffer: u64,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -526,10 +554,16 @@ fn default_block_doh() -> bool { true }
 fn default_auto_blacklist_strikes() -> u32 { 3 }
 fn default_auto_blacklist_window_secs() -> u64 { 30 }
 fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
+fn default_quota_daily_limit() -> u64 { 20_000 }
+fn default_quota_safety_buffer() -> u64 { 500 }
 
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
 fn default_request_timeout_secs() -> u64 { 30 }
+
+/// Default for `stream_timeout_secs`: 300s per-chunk idle timeout for
+/// body streaming, separate from the header/connect timeout.
+fn default_stream_timeout_secs() -> u64 { 300 }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -766,6 +800,8 @@ pub struct TomlRelay {
     pub auto_blacklist_cooldown_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    #[serde(default = "default_stream_timeout_secs")]
+    pub stream_timeout_secs: u64,
 }
 
 /// [network] section of config.toml.
@@ -919,7 +955,10 @@ impl From<TomlConfig> for Config {
             auto_blacklist_window_secs: t.relay.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: t.relay.auto_blacklist_cooldown_secs,
             request_timeout_secs: t.relay.request_timeout_secs,
+            stream_timeout_secs: t.relay.stream_timeout_secs,
             exit_node: t.exit_node,
+            quota_daily_limit: default_quota_daily_limit(),
+            quota_safety_buffer: default_quota_safety_buffer(),
         }
     }
 }
@@ -946,6 +985,7 @@ impl From<&Config> for TomlConfig {
                 auto_blacklist_window_secs: c.auto_blacklist_window_secs,
                 auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
                 request_timeout_secs: c.request_timeout_secs,
+                stream_timeout_secs: c.stream_timeout_secs,
             },
             network: TomlNetwork {
                 google_ip: c.google_ip.clone(),
